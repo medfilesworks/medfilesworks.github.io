@@ -1,11 +1,13 @@
+"""medfilesworks v2 — authorized Google Drive in-place file updater."""
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import hmac
 import io
-import re
 import secrets
 import time
-import hmac
-import hashlib
-import base64
-from collections import Counter
 from urllib.parse import urlencode
 
 import requests
@@ -13,243 +15,387 @@ import streamlit as st
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
-st.set_page_config(page_title="medfilesworks", page_icon="📁", layout="wide")
-st.markdown("""<style>html,body,[class*=css]{direction:rtl} input,textarea{direction:ltr!important} .stCode{direction:ltr}</style>""",unsafe_allow_html=True)
-st.title("medfilesworks | إدارة تحديث ملفات Drive")
-st.caption("تحديث محتوى الملفات مع الاحتفاظ بمعرّفاتها وروابطها وصلاحياتها")
+from audit import audit_row, fetch_audit, save_audit
+from drive_ops import (
+    FOLDER, MAX_TRANSFER_BYTES, build_plan, ensure_binary_target,
+    ensure_folder, extract_id, fetch_source, file_url, get_metadata, is_descendant,
+    list_available_folders, list_children, replace_content, scan_tree,
+    validate_manual_format,
+)
 
-SCOPES = ["https://www.googleapis.com/auth/drive", "openid", "https://www.googleapis.com/auth/userinfo.email"]
-NATIVE_PREFIX = "application/vnd.google-apps."
+st.set_page_config(page_title='medfilesworks | Drive Workspace', page_icon='📁', layout='wide')
+st.markdown('''<style>
+.stApp {direction:rtl;} input, textarea, [data-testid="stDataFrame"] {direction:ltr!important;}
+.block-container {max-width:1320px;padding-top:1.7rem;}
+[data-testid="stMetric"] {border:1px solid rgba(125,125,125,.22);border-radius:12px;padding:12px;}
+</style>''', unsafe_allow_html=True)
+SCOPES = ['https://www.googleapis.com/auth/drive', 'openid', 'https://www.googleapis.com/auth/userinfo.email']
+OWNER = 'marah.h.musallam21@gmail.com'
 
-def config(key):
-    try: return st.secrets[key]
-    except Exception: st.error(f"إعداد ناقص: {key}"); st.stop()
 
-CLIENT_ID, CLIENT_SECRET, REDIRECT = config("GOOGLE_CLIENT_ID"),config("GOOGLE_CLIENT_SECRET"),config("REDIRECT_URI")
-ALLOWED = {str(x).strip().lower() for x in config("ALLOWED_EMAILS")}
-STATE_SECRET = config("STATE_SIGNING_KEY")
+def setting(name, default=None):
+    try:
+        return st.secrets[name]
+    except (KeyError, FileNotFoundError):
+        return default
+
+
+CLIENT_ID = setting('GOOGLE_CLIENT_ID')
+CLIENT_SECRET = setting('GOOGLE_CLIENT_SECRET')
+REDIRECT = setting('REDIRECT_URI')
+STATE_SECRET = setting('STATE_SIGNING_KEY')
+ALLOWED = {str(x).strip().lower() for x in (setting('ALLOWED_EMAILS', []) or [])}
+SUPABASE_URL = setting('SUPABASE_URL', '')
+SUPABASE_KEY = setting('SUPABASE_SERVICE_ROLE_KEY', '')
+
+st.title('medfilesworks')
+st.caption('إدارة تحديث ملفات Google Drive | استبدال المحتوى مع الحفاظ على الرابط ومعرّف الملف')
+
+missing = [k for k, v in {
+    'GOOGLE_CLIENT_ID': CLIENT_ID, 'GOOGLE_CLIENT_SECRET': CLIENT_SECRET,
+    'REDIRECT_URI': REDIRECT, 'STATE_SIGNING_KEY': STATE_SECRET,
+    'ALLOWED_EMAILS': ALLOWED,
+}.items() if not v]
+if missing:
+    st.error('إعدادات Streamlit Secrets ناقصة: ' + ', '.join(missing))
+    st.info('افتحي Streamlit Community Cloud → My apps → Settings → Secrets وأضيفي القيم من ملف الإرشادات.')
+    st.stop()
+
 
 def make_state():
-    payload = f"{int(time.time())}.{secrets.token_urlsafe(16)}"
-    signature = hmac.new(STATE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}.{signature}".encode()).decode()
+    value = f'{int(time.time())}.{secrets.token_urlsafe(24)}'
+    signature = hmac.new(str(STATE_SECRET).encode(), value.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f'{value}.{signature}'.encode()).decode()
+
 
 def valid_state(value):
     try:
         decoded = base64.urlsafe_b64decode(value.encode()).decode()
-        timestamp, nonce, signature = decoded.split(".")
-        payload = f"{timestamp}.{nonce}"
-        expected = hmac.new(STATE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(signature, expected) and 0 <= time.time() - int(timestamp) < 600
-    except (ValueError, UnicodeError, TypeError):
+        stamp, nonce, signature = decoded.split('.')
+        expected = hmac.new(str(STATE_SECRET).encode(), f'{stamp}.{nonce}'.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature) and 0 <= time.time()-int(stamp) < 600
+    except (ValueError, TypeError, UnicodeError):
         return False
 
-def google_login():
-    state = make_state()
-    query = urlencode({"client_id":CLIENT_ID,"redirect_uri":REDIRECT,"response_type":"code","scope":" ".join(SCOPES),"access_type":"offline","prompt":"consent","state":state})
-    st.link_button("تسجيل الدخول باستخدام Google", "https://accounts.google.com/o/oauth2/v2/auth?"+query)
+
+def login_url():
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' + urlencode({
+        'client_id': CLIENT_ID, 'redirect_uri': REDIRECT,
+        'response_type': 'code', 'scope': ' '.join(SCOPES),
+        'access_type': 'offline', 'prompt': 'consent', 'state': make_state(),
+    })
+
 
 def exchange(code):
-    r=requests.post("https://oauth2.googleapis.com/token",data={"code":code,"client_id":CLIENT_ID,"client_secret":CLIENT_SECRET,"redirect_uri":REDIRECT,"grant_type":"authorization_code"},timeout=30)
+    r = requests.post('https://oauth2.googleapis.com/token', data={
+        'code': code, 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET,
+        'redirect_uri': REDIRECT, 'grant_type': 'authorization_code',
+    }, timeout=30)
     r.raise_for_status()
     return r.json()
 
+
 def credentials():
-    tok=st.session_state.get("tokens")
-    if not tok: return None
-    creds=Credentials(token=tok.get("access_token"),refresh_token=tok.get("refresh_token"),token_uri="https://oauth2.googleapis.com/token",client_id=CLIENT_ID,client_secret=CLIENT_SECRET,scopes=SCOPES)
-    # Refresh only when a Drive call signals token expiration; token response has no datetime here.
-    return creds
+    tok = st.session_state.get('tokens')
+    if not tok:
+        return None
+    return Credentials(
+        token=tok.get('access_token'), refresh_token=tok.get('refresh_token'),
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, scopes=SCOPES,
+    )
 
-def drive():
-    return build("drive","v3",credentials=credentials(),cache_discovery=False)
 
-def run_drive(fn):
-    try: return fn(drive())
-    except Exception as exc:
-        if "401" in str(exc) and st.session_state.get("tokens",{}).get("refresh_token"):
-            creds=credentials();creds.refresh(Request());st.session_state.tokens["access_token"]=creds.token
-            return fn(drive())
+def refresh_token():
+    cr = credentials()
+    if not cr or not cr.refresh_token:
+        raise PermissionError('انتهت صلاحية تسجيل الدخول؛ سجّلي الدخول من جديد')
+    cr.refresh(Request())
+    st.session_state.tokens['access_token'] = cr.token
+    return cr.token
+
+
+def run_drive(operation):
+    try:
+        return operation(build('drive', 'v3', credentials=credentials(), cache_discovery=False))
+    except Exception as e:
+        # One retry only for an expired access token.
+        if ('401' in str(e) or 'invalid credentials' in str(e).lower()) and credentials() and credentials().refresh_token:
+            refresh_token()
+            return operation(build('drive', 'v3', credentials=credentials(), cache_discovery=False))
         raise
 
-def extract_id(value):
-    value=value.strip()
-    for pat in [r"/file/d/([\w-]+)",r"/folders/([\w-]+)",r"[?&]id=([\w-]+)",r"/d/([\w-]+)"]:
-        match=re.search(pat,value)
-        if match:return match.group(1)
-    if re.fullmatch(r"[\w-]{20,}",value):return value
-    raise ValueError("رابط أو معرّف غير صالح")
 
-def metadata(api,file_id):
-    return api.files().get(fileId=file_id,fields="id,name,mimeType,webViewLink,size,parents,capabilities(canEdit)",supportsAllDrives=True).execute()
+def logout():
+    st.session_state.clear()
+    st.query_params.clear()
+    st.rerun()
 
-def list_folder(api,folder_id):
-    files=[];page=None
-    while True:
-        result=api.files().list(q=f"'{folder_id}' in parents and trashed = false",fields="nextPageToken,files(id,name,mimeType,size,capabilities(canEdit))",pageSize=1000,pageToken=page,supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
-        files.extend(result.get("files",[]));page=result.get("nextPageToken")
-        if not page:break
-    return files
 
-def check_target(f):
-    if f.get("mimeType","").startswith(NATIVE_PREFIX):raise ValueError("ملف Google أصلي؛ غير مدعوم في الاستبدال الثنائي")
-    if f.get("capabilities",{}).get("canEdit") is False:raise PermissionError("لا توجد صلاحية تعديل")
-
-def update_from_bytes(api,target,content,mime):
-    check_target(target)
-    media=MediaIoBaseUpload(io.BytesIO(content),mimetype=mime or target["mimeType"],resumable=True)
-    return api.files().update(fileId=target["id"],media_body=media,fields="id,name,webViewLink",supportsAllDrives=True).execute()
-
-def download_bytes(api,source):
-    if source["mimeType"].startswith(NATIVE_PREFIX):raise ValueError("ملف مصدر من نوع Google أصلي؛ غير مدعوم")
-    return api.files().get_media(fileId=source["id"],supportsAllDrives=True).execute()
-
-# OAuth state is signed and time-limited; browser session state may reset on redirect.
-params=st.query_params
-if "code" in params:
-    if not valid_state(params.get("state", "")):
-        st.error("انتهت جلسة تسجيل الدخول أو فشل التحقق الأمني. أعيدي المحاولة.")
-        if st.button("إعادة تسجيل الدخول"):st.query_params.clear();st.rerun()
+params = st.query_params
+if 'error' in params:
+    st.error('رفض Google تسجيل الدخول: ' + str(params.get('error')))
+    if st.button('المحاولة مجددًا'):
+        st.query_params.clear(); st.rerun()
+    st.stop()
+if 'code' in params:
+    if not valid_state(params.get('state', '')):
+        st.error('تعذر التحقق من جلسة Google. أعيدي تسجيل الدخول.')
+        if st.button('إعادة المحاولة'):
+            st.query_params.clear(); st.rerun()
         st.stop()
     try:
-        st.session_state.tokens=exchange(params["code"])
+        st.session_state.tokens = exchange(params['code'])
         st.query_params.clear()
         st.rerun()
-    except Exception as e:st.error(f"تعذر تسجيل الدخول: {e}");st.stop()
+    except requests.RequestException:
+        st.error('فشل الاتصال بخدمة تسجيل الدخول لدى Google. راجعي رابط العودة وبيانات OAuth.')
+        st.stop()
 
 if not credentials():
-    st.info("سجّلي الدخول بحساب Google لديه صلاحية تعديل الملفات المطلوبة.")
-    google_login();st.stop()
-
-try:
-    profile=requests.get("https://www.googleapis.com/oauth2/v2/userinfo",headers={"Authorization":"Bearer "+st.session_state.tokens["access_token"]},timeout=15)
-    if profile.status_code==401 and st.session_state.tokens.get("refresh_token"):
-        cr=credentials();cr.refresh(Request());st.session_state.tokens["access_token"]=cr.token
-        profile=requests.get("https://www.googleapis.com/oauth2/v2/userinfo",headers={"Authorization":"Bearer "+cr.token},timeout=15)
-    profile.raise_for_status();email=profile.json().get("email","").lower()
-except Exception as e:
-    st.error(f"تعذر التحقق من الحساب: {e}");st.stop()
-
-if email not in ALLOWED:
-    st.error("هذا الحساب غير مدرج في قائمة المستخدمين المسموح لهم.")
-    if st.button("تسجيل الخروج"):st.session_state.clear();st.rerun()
+    st.info('الدخول محصور بالحسابات الثلاثة المصرح لها. صلاحيات Drive تحدد الملفات التي يمكن تعديلها.')
+    st.link_button('تسجيل الدخول باستخدام Google', login_url(), type='primary')
     st.stop()
 
-st.success(f"متصل بالحساب: {email} — {'المالكة' if email == 'marah.h.musallam21@gmail.com' else 'محرر'}")
-if st.button("تسجيل الخروج"):
-    st.session_state.clear();st.rerun()
+try:
+    token = st.session_state.tokens['access_token']
+    response = requests.get('https://www.googleapis.com/oauth2/v2/userinfo',
+                            headers={'Authorization': 'Bearer '+token}, timeout=15)
+    if response.status_code == 401:
+        token = refresh_token()
+        response = requests.get('https://www.googleapis.com/oauth2/v2/userinfo',
+                                headers={'Authorization': 'Bearer '+token}, timeout=15)
+    response.raise_for_status()
+    email = response.json().get('email', '').strip().lower()
+except Exception:
+    st.error('تعذر التحقق من هوية الحساب. سجّلي الدخول مجددًا.')
+    if st.button('تسجيل الخروج'):
+        logout()
+    st.stop()
+if email not in ALLOWED:
+    st.error('هذا الحساب غير مصرح له باستخدام المنصة.')
+    if st.button('تسجيل الخروج'):
+        logout()
+    st.stop()
 
-browser,manual,bulk=st.tabs(["استعراض ملفات Drive","تحديث يدوي","تحديث جماعي بين مجلدين"])
-with browser:
-    st.subheader("استعراض المجلدات المشتركة")
-    st.caption("تظهر العناصر التي يستطيع الحساب الحالي الوصول إليها. للمجلدات المشتركة معك، قد تحتاج إلى فتحها من رابطها أولًا.")
-    folder_link=st.text_input("رابط مجلد لعرض محتوياته (اختياري)",key="browse_folder")
-    if st.button("عرض المجلد",key="browse_button"):
+with st.sidebar:
+    st.subheader('الحساب الحالي')
+    st.write(email)
+    st.caption('المالكة / الإدارة' if email == OWNER else 'محرر')
+    st.caption('السجلات الدائمة: مفعّلة' if SUPABASE_URL and SUPABASE_KEY else 'السجلات الدائمة: غير مفعّلة')
+    if st.button('تسجيل الخروج', use_container_width=True):
+        logout()
+    st.divider()
+    st.caption('لا يتم حذف الملفات الأصلية أو تغيير روابطها. ملفات Google الأصلية غير مدعومة للاستبدال الثنائي.')
+
+if 'session_audit' not in st.session_state:
+    st.session_state.session_audit = []
+
+
+def record(action, target, status, detail=''):
+    row = audit_row(email, action, target['id'], target['name'], status, detail)
+    st.session_state.session_audit.insert(0, row)
+    saved, message = save_audit(row, SUPABASE_URL, SUPABASE_KEY)
+    return saved, message
+
+
+def table_rows(items):
+    return [{'الاسم': f['name'], 'النوع': 'مجلد' if f['mimeType']==FOLDER else f['mimeType'],
+             'الحجم (بايت)': f.get('size', ''), 'الرابط': file_url(f)} for f in items]
+
+
+browse, manual, bulk, history = st.tabs(['مستكشف Drive', 'تحديث ملف', 'تحديث جماعي', 'سجل العمليات'])
+
+with browse:
+    st.subheader('استعراض الملفات والمجلدات')
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        folder_url = st.text_input('رابط المجلد (أو معرّفه)', key='browse_url')
+    with c2:
+        st.write('')
+        if st.button('فتح المجلد', use_container_width=True):
+            try:
+                folder_id = extract_id(folder_url)
+                meta = run_drive(lambda api: get_metadata(api, folder_id))
+                ensure_folder(meta)
+                st.session_state.browse_folder = meta
+                st.session_state.browse_items = run_drive(lambda api: list_children(api, folder_id))
+            except Exception as exc:
+                st.error(f'تعذر فتح المجلد: {exc}')
+    if st.button('عرض المجلدات المتاحة'):
         try:
-            fid=extract_id(folder_link)
-            folder=run_drive(lambda a:metadata(a,fid))
-            if folder['mimeType']!='application/vnd.google-apps.folder':raise ValueError('الرابط ليس مجلدًا')
-            entries=run_drive(lambda a:list_folder(a,fid))
-            st.session_state.browse_items=entries
-            st.session_state.browse_title=folder['name']
-        except Exception as e:st.error(str(e))
-    if st.button("عرض المجلدات المتاحة",key="browse_root"):
-        try:
-            def get_folders(api):
-                items=[];token=None
-                while True:
-                    res=api.files().list(q="mimeType = 'application/vnd.google-apps.folder' and trashed = false",fields="nextPageToken,files(id,name,mimeType,webViewLink)",pageSize=1000,pageToken=token).execute()
-                    items+=res.get('files',[]);token=res.get('nextPageToken')
-                    if not token:break
-                return items
-            st.session_state.browse_items=run_drive(get_folders)
-            st.session_state.browse_title='المجلدات المتاحة'
-        except Exception as e:st.error(str(e))
-    if 'browse_items' in st.session_state:
-        st.write(st.session_state.get('browse_title','الملفات'))
-        items=st.session_state.browse_items
-        st.dataframe([{'الاسم':f['name'],'النوع':'مجلد' if f['mimeType']=='application/vnd.google-apps.folder' else 'ملف','الرابط':'https://drive.google.com/drive/folders/'+f['id'] if f['mimeType']=='application/vnd.google-apps.folder' else 'https://drive.google.com/file/d/'+f['id']+'/view'} for f in items],hide_index=True,use_container_width=True)
-        st.caption('للتحديث اليدوي انسخي رابط الملف من الجدول إلى تبويب التحديث اليدوي.')
+            st.session_state.browse_folder = {'name':'المجلدات المتاحة'}
+            st.session_state.browse_items = run_drive(lambda api: list_available_folders(api))
+        except Exception as exc:
+            st.error(f'تعذر استعراض Drive: {exc}')
+    items = st.session_state.get('browse_items', [])
+    if 'browse_folder' in st.session_state:
+        st.write('**' + st.session_state.browse_folder['name'] + '**')
+        st.metric('العناصر المعروضة', len(items))
+        st.dataframe(table_rows(items), hide_index=True, use_container_width=True,
+                     column_config={'الرابط': st.column_config.LinkColumn('الرابط')})
+        folders = [x for x in items if x['mimeType'] == FOLDER]
+        if folders:
+            names = {f"{f['name']} · {f['id'][:8]}":f for f in folders}
+            choice = st.selectbox('انتقلي إلى مجلد فرعي', list(names))
+            if st.button('فتح المجلد الفرعي'):
+                item = names[choice]
+                try:
+                    st.session_state.browse_folder = item
+                    st.session_state.browse_items = run_drive(lambda api: list_children(api, item['id']))
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
 
 with manual:
-    st.subheader("استبدال ملف واحد")
-    url=st.text_input("رابط الملف الأصلي أو معرّفه")
-    upload=st.file_uploader("النسخة الجديدة من جهازك",key="manual_upload")
-    if st.button("فحص الملف",key="manual_check"):
+    st.subheader('استبدال محتوى ملف واحد')
+    st.caption('التحديث يتم على الملف نفسه عبر Google Drive API؛ لا يُنشأ ملف بديل ولا يُحذف الأصل.')
+    target_url = st.text_input('رابط الملف الأصلي', key='manual_url')
+    upload = st.file_uploader('ارفعي النسخة الجديدة من جهازك (حتى 100 MB)', key='manual_file')
+    if st.button('فحص الملف الأصلي', key='manual_scan'):
         try:
-            f=run_drive(lambda a:metadata(a,extract_id(url)));check_target(f)
-            st.session_state.manual_target=f
-            st.success(f"الملف المستهدف: {f['name']} — {f['id']}")
-        except Exception as e:st.session_state.pop("manual_target",None);st.error(str(e))
-    target=st.session_state.get("manual_target")
-    if target:
-        st.warning(f"سيُستبدل محتوى {target['name']} ولن يتغير معرّفه.")
-        confirm=st.checkbox("أؤكد أنني راجعت الملف المستهدف والنسخة الجديدة",key="manual_confirm")
-        if st.button("تنفيذ التحديث",disabled=not(confirm and upload),key="manual_update"):
+            item = run_drive(lambda api: get_metadata(api, extract_id(target_url)))
+            ensure_binary_target(item)
+            st.session_state.manual_preview = item
+        except Exception as exc:
+            st.session_state.pop('manual_preview', None)
+            st.error(str(exc))
+    preview = st.session_state.get('manual_preview')
+    if preview:
+        st.info(f"الاسم: {preview['name']} | المعرّف الثابت: {preview['id']} | النوع: {preview['mimeType']}")
+        st.link_button('معاينة الملف الأصلي في Drive', file_url(preview))
+        st.caption('المعاينة تعرض بيانات الملف ورابطه؛ افتحيه في Drive لمراجعة محتواه قبل الاستبدال.')
+        if upload:
+            st.write(f'النسخة الجديدة: **{upload.name}** — {upload.size:,} بايت')
+        confirm = st.checkbox('راجعت الملف والنسخة الجديدة، وأوافق على استبدال المحتوى', key='manual_ok')
+        if st.button('تنفيذ التحديث', type='primary', disabled=not(upload and confirm), key='manual_execute'):
             try:
-                # Ensure source URL has not changed since preview.
-                if extract_id(url)!=target["id"]:raise ValueError("تغير الرابط؛ أعيدي الفحص")
-                latest=run_drive(lambda a:metadata(a,target["id"]))
-                result=run_drive(lambda a:update_from_bytes(a,latest,upload.getvalue(),latest["mimeType"]))
-                st.success("تم التحديث بنجاح. معرّف الملف ثابت: "+result["id"])
-                st.session_state.pop("manual_target",None)
-            except Exception as e:st.error(f"فشل التحديث: {e}")
+                if extract_id(target_url) != preview['id']:
+                    raise ValueError('تغير رابط الملف؛ أعيدي الفحص')
+                validate_manual_format(preview, upload.name)
+                if upload.size > MAX_TRANSFER_BYTES:
+                    raise ValueError('الملف يتجاوز 100 MB')
+                result = run_drive(lambda api: replace_content(api, preview, upload.getvalue()))
+                _, message = record('manual_update', preview, 'success', 'In-place update; file ID retained')
+                st.success('نجح التحديث، ومعرّف الملف لم يتغير: '+result['id'])
+                if message:
+                    st.warning(message)
+                st.link_button('فتح الرابط الأصلي', file_url(preview))
+                st.session_state.pop('manual_preview', None)
+            except Exception as exc:
+                _, message = record('manual_update', preview, 'failed', str(exc))
+                st.error(f'فشل التحديث: {exc}')
+                if message:
+                    st.warning(message)
 
 with bulk:
-    st.subheader("مطابقة الملفات بالاسم بين مجلدين")
-    st.info("المطابقة تشمل الملفات الموجودة مباشرة داخل المجلدين، وليس المجلدات الفرعية. لا تُحذف الملفات غير المتطابقة.")
-    old=st.text_input("رابط مجلد الملفات الأصلية",key="old_folder")
-    new=st.text_input("رابط مجلد النسخ الجديدة",key="new_folder")
-    if st.button("فحص المجلدين"):
+    st.subheader('تحديث ملفات مجلد كامل')
+    st.caption('المطابقة حسب المسار النسبي واسم الملف، مع خيار فحص المجلدات الفرعية. لا تُحذف الملفات غير المتطابقة.')
+    old_url = st.text_input('رابط مجلد الملفات الأصلية', key='bulk_old')
+    new_url = st.text_input('رابط مجلد النسخ الجديدة', key='bulk_new')
+    recursive = st.checkbox('تضمين المجلدات الفرعية', value=True, key='bulk_recursive')
+    if st.button('فحص المجلدين وبناء خطة التحديث'):
         try:
-            old_id,new_id=extract_id(old),extract_id(new)
-            if old_id==new_id:raise ValueError("يجب اختيار مجلدين مختلفين")
-            originals=run_drive(lambda a:list_folder(a,old_id))
-            updates=run_drive(lambda a:list_folder(a,new_id))
-            oc=Counter(f["name"] for f in originals);nc=Counter(f["name"] for f in updates)
-            oldmap={f["name"]:f for f in originals if oc[f["name"]]==1}
-            newmap={f["name"]:f for f in updates if nc[f["name"]]==1}
-            pairs=[];skipped=[]
-            for name,source in newmap.items():
-                if name not in oldmap:skipped.append((name,"لا يوجد ملف أصلي مطابق"));continue
-                target=oldmap[name]
-                if source["mimeType"].startswith(NATIVE_PREFIX) or target["mimeType"].startswith(NATIVE_PREFIX):skipped.append((name,"نوع Google أصلي غير مدعوم"));continue
-                if target.get("capabilities",{}).get("canEdit") is False:skipped.append((name,"لا توجد صلاحية تعديل"));continue
-                if source["mimeType"]!=target["mimeType"]:skipped.append((name,"نوع الملف مختلف"));continue
-                pairs.append((target,source))
-            for name in sorted(set(n for n,c in oc.items() if c>1)|set(n for n,c in nc.items() if c>1)):skipped.append((name,"اسم مكرر؛ يلزم معالجة يدوية"))
-            st.session_state.bulk_plan={"old":old_id,"new":new_id,"pairs":pairs,"skipped":skipped}
-        except Exception as e:st.session_state.pop("bulk_plan",None);st.error(str(e))
-    plan=st.session_state.get("bulk_plan")
+            old_id, new_id = extract_id(old_url), extract_id(new_url)
+            if old_id == new_id:
+                raise ValueError('لا يمكن استخدام نفس المجلد كمصدر وهدف')
+            def make_plan(api):
+                ensure_folder(get_metadata(api, old_id))
+                ensure_folder(get_metadata(api, new_id))
+                if is_descendant(api, old_id, new_id) or is_descendant(api, new_id, old_id):
+                    raise ValueError('المجلدان متداخلان؛ اختاري مجلدين مستقلين')
+                originals = scan_tree(api, old_id, recursive=recursive)
+                sources = scan_tree(api, new_id, recursive=recursive)
+                return build_plan(originals, sources)
+            ready, skipped = run_drive(make_plan)
+            st.session_state.bulk_plan = {'old':old_id,'new':new_id,'recursive':recursive,
+                                          'ready':ready,'skipped':skipped}
+            st.session_state.bulk_confirm = False
+        except Exception as exc:
+            st.session_state.pop('bulk_plan', None)
+            st.error(f'فشل الفحص: {exc}')
+    plan = st.session_state.get('bulk_plan')
     if plan:
-        st.metric("ملفات جاهزة للتحديث",len(plan["pairs"]))
-        if plan["pairs"]:st.dataframe([{"الاسم":t["name"],"المعرّف الأصلي":t["id"],"معرّف النسخة الجديدة":s["id"]} for t,s in plan["pairs"]],hide_index=True,use_container_width=True)
-        if plan["skipped"]:st.warning(f"ملفات مستبعدة: {len(plan['skipped'])}");st.dataframe([{"الاسم":n,"السبب":why} for n,why in plan["skipped"]],hide_index=True,use_container_width=True)
-        agree=st.checkbox("راجعت المطابقات وأوافق على استبدال محتوى الملفات الأصلية",key="bulk_agree")
-        if st.button("بدء التحديث الجماعي",disabled=not agree or not plan["pairs"]):
-            if extract_id(old)!=plan["old"] or extract_id(new)!=plan["new"]:st.error("تغير أحد المجلدين؛ أعيدي الفحص")
+        a, b = st.columns(2)
+        a.metric('جاهزة للتحديث', len(plan['ready']))
+        b.metric('مستبعدة', len(plan['skipped']))
+        if plan['ready']:
+            st.dataframe([{'المسار':p['path'], 'الأصل':p['target']['id'],
+                           'المصدر':p['source']['id'], 'حجم المصدر':p['source'].get('size','')}
+                          for p in plan['ready']], hide_index=True, use_container_width=True)
+        if plan['skipped']:
+            with st.expander('عرض الملفات المستبعدة وأسباب الاستبعاد'):
+                st.dataframe(plan['skipped'], hide_index=True, use_container_width=True)
+        agree = st.checkbox('راجعت جميع المطابقات وأوافق على تحديث الملفات الأصلية', key='bulk_confirm')
+        if st.button('بدء التحديث الجماعي', type='primary', disabled=not(agree and plan['ready'])):
+            if (extract_id(old_url)!=plan['old'] or extract_id(new_url)!=plan['new']
+                    or recursive!=plan['recursive']):
+                st.error('تغيرت إعدادات المجلدات؛ أعيدي الفحص')
             else:
-                results=[];progress=st.progress(0)
-                for i,(target,source) in enumerate(plan["pairs"]):
+                results = []
+                bar = st.progress(0)
+                for i, pair in enumerate(plan['ready']):
+                    dst, src = pair['target'], pair['source']
                     try:
-                        def process(api):
-                            current=metadata(api,target["id"])
-                            if current["name"]!=target["name"]:raise ValueError("تغير اسم الملف الأصلي بعد الفحص")
-                            src=metadata(api,source["id"])
-                            if src["name"]!=source["name"]:raise ValueError("تغير اسم الملف الجديد بعد الفحص")
-                            payload=download_bytes(api,src)
-                            return update_from_bytes(api,current,payload,src["mimeType"])
-                        result=run_drive(process)
-                        results.append({"الملف":target["name"],"النتيجة":"نجاح","المعرّف":result["id"]})
-                    except Exception as e:results.append({"الملف":target["name"],"النتيجة":"فشل: "+str(e),"المعرّف":target["id"]})
-                    progress.progress((i+1)/len(plan["pairs"]))
-                st.dataframe(results,hide_index=True,use_container_width=True)
-                import csv
-                buffer=io.StringIO();writer=csv.DictWriter(buffer,fieldnames=["الملف","النتيجة","المعرّف"]);writer.writeheader();writer.writerows(results)
-                st.download_button("تنزيل تقرير النتائج CSV",buffer.getvalue().encode("utf-8-sig"),"update_report.csv","text/csv")
-                st.session_state.pop("bulk_plan",None)
+                        def update_one(api):
+                            # Recheck the source and target before writing.
+                            current_source = get_metadata(api, src['id'])
+                            if (str(current_source.get('version','')) != str(src.get('version',''))
+                                    or current_source['name'] != src['name']):
+                                raise ValueError('تغير المصدر بعد المعاينة؛ أعيدي الفحص')
+                            if current_source['mimeType'] != dst['mimeType']:
+                                raise ValueError('نوع الملف تغير')
+                            payload = fetch_source(api, current_source)
+                            return replace_content(api, dst, payload)
+                        outcome = run_drive(update_one)
+                        status, detail = 'success', 'ID retained: '+outcome['id']
+                    except Exception as exc:
+                        status, detail = 'failed', str(exc)
+                    _, warning = record('bulk_update', dst, status, detail)
+                    results.append({'المسار':pair['path'], 'الملف':dst['name'],
+                                    'النتيجة':'نجاح' if status=='success' else 'فشل',
+                                    'التفاصيل':detail, 'معرّف الأصل':dst['id']})
+                    bar.progress((i+1)/len(plan['ready']))
+                st.session_state.last_bulk_results = results
+                st.session_state.pop('bulk_plan', None)
+                st.success(f"اكتمل التنفيذ: {sum(x['النتيجة']=='نجاح' for x in results)} ناجح من {len(results)}")
+                if warning:
+                    st.warning(warning)
+    if st.session_state.get('last_bulk_results'):
+        rows = st.session_state.last_bulk_results
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+        buff = io.StringIO()
+        writer = csv.DictWriter(buff, fieldnames=list(rows[0].keys()))
+        writer.writeheader(); writer.writerows(rows)
+        st.download_button('تنزيل تقرير CSV', buff.getvalue().encode('utf-8-sig'),
+                           'medfilesworks_results.csv', mime='text/csv')
+
+with history:
+    st.subheader('سجل عمليات التحديث')
+    if SUPABASE_URL and SUPABASE_KEY:
+        if email == OWNER:
+            try:
+                rows = fetch_audit(SUPABASE_URL, SUPABASE_KEY)
+                st.caption('السجل الدائم من Supabase — جميع الحسابات')
+            except requests.RequestException:
+                rows = st.session_state.session_audit
+                st.warning('تعذر قراءة السجل الدائم؛ يتم عرض سجل الجلسة الحالية')
+        else:
+            rows = st.session_state.session_audit
+            st.caption('سجل الجلسة الحالية؛ السجل الدائم الكامل متاح للمالكة فقط')
+    else:
+        rows = st.session_state.session_audit
+        st.warning('السجل الحالي مؤقت. لتفعيل سجل دائم، أضيفي Supabase Secrets ونفّذي ملف SQL المرفق.')
+    if rows:
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+        buff = io.StringIO()
+        writer = csv.DictWriter(buff, fieldnames=list(rows[0].keys()))
+        writer.writeheader();writer.writerows(rows)
+        st.download_button('تصدير السجل CSV', buff.getvalue().encode('utf-8-sig'),
+                           'medfilesworks_audit.csv', mime='text/csv')
+    else:
+        st.info('لا توجد عمليات مسجلة بعد.')
 
 st.divider()
-st.caption("تُحفظ رموز Google في جلسة التطبيق فقط، ولا تُخزن في المستودع. استخدمي HTTPS ولا تضعي أسرار OAuth في ملفات GitHub.")
+st.caption('حد الملفات: 100 MB للملف، 2000 ملف للفحص، عمق 12 مجلدًا. لا يُنفذ التحديث إلا بعد المعاينة والموافقة.')

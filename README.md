@@ -1,34 +1,78 @@
-# medfilesworks — Google Drive updater
+# medfilesworks v2 — Google Drive in-place updater
 
-A Streamlit web application for three authorized Google accounts. Updates existing non-native Drive files **in place** using Drive API `files.update`, retaining the existing file ID and link.
+## What this version implements
 
-## Accounts
-- Owner/admin label: `marah.h.musallam21@gmail.com`
-- Editors: `dr.khalil.lectures@gmail.com`, `pmsf.education@gmail.com`
+- Google OAuth sign-in and an explicit allowlist for three accounts.
+- Drive folder browser, including entering subfolders and opening Drive links.
+- Manual binary-file replacement **in place** with `files.update` (retains existing Drive file ID/link).
+- Recursive bulk update: match files by **relative path + filename** across two folder trees; show a dry-run preview and excluded items; require confirmation before writing.
+- Safeguards: rejects Google Docs/Sheets/Slides native formats, duplicate names in a folder, same/overlapping roots, wrong MIME, changed target/source versions, files over 100 MB, empty payloads, and files without editing rights.
+- Session audit log and CSV export. **Optional** persistent Supabase audit (owner sees full log).
+- No delete API calls; no automatic changes without an explicit confirmation.
 
-The app does not transfer Drive file ownership. Users must have Editor access to each target folder/file in Google Drive. The app's owner label does not confer extra Drive permissions.
+## Existing production app: setup and OAuth
 
-## Deploy from iPad
-1. Create a **private** GitHub repository named `medfilesworks` and upload `app.py`, `requirements.txt`, `.gitignore`, and this README. Do **not** upload credentials or secrets.
-2. At https://share.streamlit.io deploy a new app from that repository; main file path: `app.py`. Choose a subdomain.
-3. In Google Cloud → Google Auth Platform → Clients → `medfilesworks-web`, add the **exact** deployed app URL (including final slash, if used in `REDIRECT_URI`) under **Authorized redirect URIs**. No JavaScript origin is needed for this server-side authorization flow.
-4. In Streamlit Cloud → App settings → Secrets, paste the entries from `.streamlit_secrets_example.toml`, replacing placeholder values. `REDIRECT_URI` must exactly match the authorized redirect URI. Generate a unique 32+ character `STATE_SIGNING_KEY` and keep it secret.
-5. In Google Auth Platform → Audience → Test users, add the three authorized emails. Ensure Google Drive API is enabled and Google Auth Platform → Data access has the requested Drive scope `https://www.googleapis.com/auth/drive`. Google will display a consent warning for an unverified testing app. Testing-mode OAuth refresh tokens can expire in seven days; users may need to sign in again.
-6. Open the Streamlit app URL and log in with an authorized Google account. Share the target folders in Drive with the editors using **Editor** access.
-7. Test first on a disposable PDF: copy its existing URL, update it in the manual tab, reopen the original URL and verify the contents changed and file ID stayed identical.
+1. Open **https://share.streamlit.io** > **My apps** > `medfilesworks` > **Settings** > **Secrets**.
+2. Paste the values from `.streamlit_secrets_example.toml`, substituting your real Google OAuth Client ID/Secret. Keep the secret only in Streamlit Secrets, **never in GitHub**.
+3. `REDIRECT_URI` must exactly match the **actual deployed URL** (e.g. `https://medfilesworks.streamlit.app`) with the same trailing slash convention on both sides.
+4. In **Google Cloud Console** > **Google Auth Platform** > **Clients** > the Web application OAuth client > **Authorized redirect URIs**, add the identical URL. Click Save.
+5. In **Google Auth Platform** > **Audience**, add the three users under **Test users** (if the app is in Testing). In **Data access**, configure the requested Google Drive scope. Google may warn about an unverified app; Drive broad scope is restricted and may require verification for wider distribution.
+6. Google Drive API must be enabled for the Google Cloud project. The Drive owner must grant Editor permission to the folders/files that editors should update.
+7. Save Streamlit Secrets and restart the app if needed. Open the site and sign in with one of the allowed Google accounts.
+8. Test on a disposable PDF first: copy its URL, update the content in **تحديث ملف**, then reopen the *same* URL to verify the content changed while the ID did not.
 
-## Features
-- Google OAuth sign-in with allowlist of three emails
-- List available folders or browse contents by folder link
-- Manual update of an existing PDF/image/Office/binary file by Drive URL
-- Bulk matching of same-named files from two folder links (direct children only), preview, confirm, CSV results
+### Secrets template
 
-## Important limitations
-- Not a continuously running sync service. Bulk updates are initiated manually.
-- Does not recursively traverse subfolders.
-- Google Docs/Sheets/Slides native files cannot be replaced with binary content via this workflow.
-- The source and target file MIME types must match for bulk updates; manual updates should use the same file format as the target.
-- In-memory Streamlit session stores OAuth tokens; sign-in can be lost on session restart. A persistent multi-user production deployment should use hardened server-side session storage and OAuth state/PKCE validation before handling sensitive data.
-- Large files may hit memory or platform upload limits; bulk transfers are in-memory.
-- App-level activity history is not persisted; download the CSV after a bulk update. Google Drive may retain version/activity information according to its own policies.
-- This source has been syntax-checked, **not** integration-tested with live Google Drive credentials.
+```toml
+GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID"
+GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"
+REDIRECT_URI = "https://medfilesworks.streamlit.app"
+STATE_SIGNING_KEY = "YOUR_64_CHARACTER_RANDOM_HEX_KEY"
+ALLOWED_EMAILS = ["marah.h.musallam21@gmail.com", "dr.khalil.lectures@gmail.com", "pmsf.education@gmail.com"]
+SUPABASE_URL = ""
+SUPABASE_SERVICE_ROLE_KEY = ""
+```
+
+To generate a random signing key locally: `python -c "import secrets; print(secrets.token_hex(32))"`.
+
+## Updating the existing GitHub repository to v2
+
+Upload these files **to the repository root** (replacing the old files with the same names):
+
+- `app.py`
+- `drive_ops.py`
+- `audit.py`
+- `requirements.txt`
+- `README.md`
+- `.gitignore` (optional but recommended)
+- `supabase_schema.sql` (optional, used only for permanent logs)
+
+**Do not upload** `.streamlit_secrets_example.toml` with real values; this example has placeholders only. Do not upload `secrets.toml` or your Google OAuth JSON. The existing Streamlit deployment normally redeploys on commits to the configured branch.
+
+## Optional: durable audit history with Supabase
+
+1. Create/select a Supabase project.
+2. Open **SQL Editor** and run `supabase_schema.sql` once.
+3. From Supabase project settings/API, copy the Project URL and the **service_role key** (secret; server-only).
+4. In **Streamlit Secrets** set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
+5. Restart the app. The owner account can see audit records from all users. Editors see their current-session records. This log records metadata, not file content or OAuth tokens.
+
+Without Supabase, the audit tab is **session-only** and not persistent. This is explicitly indicated in the UI.
+
+## Limitations and safety
+
+- **No production OAuth session hardening guarantee.** The state parameter is signed and expires after 10 minutes, but this implementation does not persist a per-browser OAuth nonce/PKCE verifier across browser redirects. Use a dedicated session store + PKCE before using this with sensitive/high-stakes data at scale.
+- Google OAuth in **Testing** can issue refresh tokens that expire after 7 days. Users may need to sign in again.
+- Replaces content of **binary files** (PDF, images, Office uploads, ZIPs, etc.), not native Google Docs/Sheets/Slides.
+- A successful update preserves Drive file IDs/URLs but does not guarantee retention of *all* historical metadata, Drive revisions, or third-party caches. Test on a disposable file.
+- Max 100 MB per source/update, 2000 files per scan, max depth 12. No unattended background sync.
+- A single bulk run is **not atomic**: successful files remain updated if later files fail. Download the CSV report.
+- This code was syntax checked and pure-function unit tested. **Live Google OAuth/Drive integration and Streamlit deployment were not tested in this environment** (credentials/network not available).
+
+## Development
+
+`pip install -r requirements.txt`
+
+`streamlit run app.py`
+
+Run tests (requires pytest): `pytest -q tests/`
