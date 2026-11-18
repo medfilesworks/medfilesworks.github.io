@@ -1,15 +1,19 @@
 """Additive Streamlit page: the original medfilesworks V2 app.py is untouched."""
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import io
 import json
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+from PIL import Image
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -24,7 +28,8 @@ from v3_engine import (
     stage_batch, stage_retries, summary, update_batch,
 )
 from v3_store import firebase_is_configured, read_jobs, sync_job
-from v3_watermark import SUPPORTED_MIMES, preview_png, preview_first_page_pair, validate_config
+from v3_watermark import (SUPPORTED_MIMES, drag_stamp_png, preview_png,
+                          preview_first_page_pair, validate_config)
 
 st.set_page_config(page_title='V3 Studio | medfilesworks', page_icon='🛡️', layout='wide')
 st.markdown('''<style>
@@ -33,6 +38,17 @@ st.markdown('''<style>
 [data-testid="stMetric"] {border:1px solid rgba(125,125,125,.2);border-radius:12px;padding:12px;}
 </style>''', unsafe_allow_html=True)
 OWNER='marah.h.musallam21@gmail.com'
+position_editor = components.declare_component(
+    'medfiles_position_editor',
+    path=str(Path(__file__).resolve().parents[1] / 'v3_drag_editor'),
+)
+POSITION_OPTIONS = {
+    'أعلى اليسار': 'top_left', 'أعلى الوسط': 'top_center', 'أعلى اليمين': 'top_right',
+    'وسط اليسار': 'center_left', 'الوسط': 'center', 'وسط اليمين': 'center_right',
+    'أسفل اليسار': 'bottom_left', 'أسفل الوسط': 'bottom_center', 'أسفل اليمين': 'bottom_right',
+    'متكرر على الصفحة': 'repeated', 'توزيع حر بالسحب': 'custom',
+}
+
 STEPS = ['1. العلامة المائية', '2. المطابقة والتحديث',
          '3. المراجعة والاعتماد/التراجع', '4. السجل والتقارير']
 SCOPES=['https://www.googleapis.com/auth/drive','openid',
@@ -256,23 +272,22 @@ if current_step==STEPS[0]:
                     rotation=st.slider('الدوران',-75,75,30,5)
                     scale=st.slider('حجم العلامة',0.5,2.5,1.0,0.1)
                 with c3:
-                    placement=st.selectbox('التوزيع',['وسط','أسفل اليمين','متكرر'])
+                    placement_label=st.selectbox('التوزيع',list(POSITION_OPTIONS),
+                                                 index=list(POSITION_OPTIONS).index('الوسط'))
+                    margin=st.slider('البعد عن الحافة (%)',0.0,12.0,0.0,0.5,
+                                     disabled=POSITION_OPTIONS[placement_label] in ('custom','repeated'))
+                logo_bytes=logo_file.getvalue() if logo_file else None
                 cfg={'mode':mode_value,'text':txt,'opacity':opacity,
                      'rotation':rotation,'scale':scale,'color':color,
-                     'placement':{'وسط':'center','أسفل اليمين':'bottom_right',
-                                  'متكرر':'repeated'}[placement]}
-                logo_bytes=logo_file.getvalue() if logo_file else None
-                key=hashlib.sha256((json.dumps(cfg,sort_keys=True)+
-                                    hashlib.sha256(logo_bytes or b'').hexdigest()+
-                                    st.session_state.v3_source_id).encode()).hexdigest()
-                sample_mode=st.radio('\u0645\u0635\u062f\u0631 \u0635\u0641\u062d\u0629 \u0627\u0644\u0645\u0639\u0627\u064a\u0646\u0629',
-                                     ['\u0645\u0644\u0641 \u0645\u0646 \u0627\u0644\u0645\u062c\u0644\u062f',
-                                      '\u0631\u0641\u0639 \u0645\u0644\u0641 \u062a\u062c\u0631\u064a\u0628\u064a'],
+                     'placement':POSITION_OPTIONS[placement_label],
+                     'margin_percent':margin}
+                sample_mode=st.radio('مصدر صفحة المعاينة',
+                                     ['ملف من المجلد','رفع ملف تجريبي'],
                                      horizontal=True,key='v3_preview_source')
                 sample_file=None
-                if sample_mode.startswith('\u0631\u0641\u0639'):
+                if sample_mode.startswith('رفع'):
                     sample_file=st.file_uploader(
-                        '\u0627\u0631\u0641\u0639\u064a \u0645\u0644\u0641 PDF \u0623\u0648 \u0635\u0648\u0631\u0629 \u0644\u0645\u0639\u0627\u064a\u0646\u0629 \u0627\u0644\u0635\u0641\u062d\u0629 \u0627\u0644\u0623\u0648\u0644\u0649 \u0641\u0642\u0637',
+                        'ارفعي ملف PDF أو صورة لمعاينة الصفحة الأولى فقط',
                         type=['pdf','png','jpg','jpeg','webp'],key='v3_sample_upload')
                     chosen='sample_upload'
                     sample_hash=hashlib.sha256(sample_file.getvalue()).hexdigest() if sample_file else 'empty'
@@ -280,6 +295,62 @@ if current_step==STEPS[0]:
                     chosen=st.selectbox('اختاري ملفًا لمعاينة العلامة',list(supported),
                                         key='v3_sample_file')
                     sample_hash=str(supported[chosen].get('version',''))
+
+                if cfg['placement']=='custom':
+                    st.caption('التوزيع الحر: اسحبي العلامة مباشرة فوق صورة الصفحة الأولى. '
+                               'الموضع يُحفظ كنسبة من مساحة الصفحة ويُعمّم على بقية الصفحات، '
+                               'حتى إن اختلف حجم PDF.')
+                    source_key=(st.session_state.v3_source_id,chosen,sample_hash)
+                    if st.button('فتح الصفحة للتحريك الحر',key='v3_open_drag'):
+                        try:
+                            validate_config(cfg,logo_bytes)
+                            if sample_mode.startswith('رفع'):
+                                if not sample_file:
+                                    raise ValueError('ارفعي ملف المعاينة أولًا')
+                                if sample_file.size>MAX_TRANSFER_BYTES:
+                                    raise ValueError('ملف المعاينة أكبر من 100 MB')
+                                mime_map={'.pdf':'application/pdf','.png':'image/png',
+                                          '.jpg':'image/jpeg','.jpeg':'image/jpeg',
+                                          '.webp':'image/webp'}
+                                mime_type=mime_map.get('.'+sample_file.name.rsplit('.',1)[-1].lower())
+                                if not mime_type:
+                                    raise ValueError('صيغة ملف المعاينة غير مدعومة')
+                                source_bytes=sample_file.getvalue()
+                            else:
+                                src=supported[chosen]
+                                mime_type=src['mimeType']
+                                source_bytes=drive_call(lambda api:fetch_source(api,src))
+                            st.session_state.v3_drag_page=preview_png(source_bytes,mime_type,width=900)
+                            st.session_state.v3_drag_source=source_key
+                        except Exception as exc:
+                            st.error('تعذر فتح محرر التوزيع الحر: '+str(exc))
+                    if st.session_state.get('v3_drag_source')==source_key:
+                        base=st.session_state.v3_drag_page
+                        with Image.open(io.BytesIO(base)) as bg:
+                            page_w,page_h=bg.size
+                        mark=drag_stamp_png(page_w,page_h,cfg,logo_bytes)
+                        with Image.open(io.BytesIO(mark)) as mark_image:
+                            mark_w=mark_image.width
+                        previous=st.session_state.get('v3_custom_coords') or {'x':0.5,'y':0.5}
+                        value=position_editor(
+                            page_png_b64=base64.b64encode(base).decode('ascii'),
+                            mark_png_b64=base64.b64encode(mark).decode('ascii'),
+                            page_width=page_w, stamp_width=mark_w,
+                            x=previous['x'],y=previous['y'],
+                            key='v3_position_editor')
+                        if isinstance(value,dict) and 'x' in value and 'y' in value:
+                            st.session_state.v3_custom_coords={
+                                'x':max(0,min(1,float(value['x']))),
+                                'y':max(0,min(1,float(value['y'])))}
+                    else:
+                        st.info('اضغطي «فتح الصفحة للتحريك الحر» لعرض الورقة وسحب العلامة عليها.')
+                    xvalue=st.session_state.get('v3_custom_coords') or {'x':0.5,'y':0.5}
+                    cfg['custom_x']=xvalue['x']
+                    cfg['custom_y']=xvalue['y']
+                    st.caption(f"الموضع المعتمد: أفقي {xvalue['x']*100:.1f}% | عمودي {xvalue['y']*100:.1f}%")
+                key=hashlib.sha256((json.dumps(cfg,sort_keys=True)+
+                                    hashlib.sha256(logo_bytes or b'').hexdigest()+
+                                    st.session_state.v3_source_id).encode()).hexdigest()
                 preview_key=key+chosen+sample_hash
                 st.caption('\u0645\u0639\u0627\u064a\u0646\u0629 \u0648\u0627\u062d\u062f\u0629\u061b \u0633\u062a\u064f\u0637\u0628\u0651\u064e\u0642 \u0627\u0644\u0639\u0644\u0627\u0645\u0629 \u0628\u0646\u0641\u0633 \u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0639\u0644\u0649 \u062c\u0645\u064a\u0639 \u0635\u0641\u062d\u0627\u062a \u0643\u0644 \u0627\u0644\u0645\u0644\u0641\u0627\u062a \u0627\u0644\u0645\u062f\u0639\u0648\u0645\u0629.')
                 if st.button('\u0645\u0639\u0627\u064a\u0646\u0629 \u0627\u0644\u0635\u0641\u062d\u0629 \u0627\u0644\u0623\u0648\u0644\u0649 \u0642\u0628\u0644 \u062a\u0639\u0645\u064a\u0645 \u0627\u0644\u0639\u0644\u0627\u0645\u0629',key='v3_render_preview'):
