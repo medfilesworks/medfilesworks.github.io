@@ -38,10 +38,14 @@ st.markdown('''<style>
 [data-testid="stMetric"] {border:1px solid rgba(125,125,125,.2);border-radius:12px;padding:12px;}
 </style>''', unsafe_allow_html=True)
 OWNER='marah.h.musallam21@gmail.com'
+try:
 position_editor = components.declare_component(
-    'medfiles_position_editor',
-    path=str(Path(__file__).resolve().parents[1] / 'v3_drag_editor'),
+'medfiles_position_editor',
+path=str(Path(file).resolve().parents[1] / 'v3_drag_editor'),
 )
+except Exception as exc:
+st.error(f'تعذر تحميل محرر السحب: {exc}')
+st.stop()
 POSITION_OPTIONS = {
     'أعلى اليسار': 'top_left', 'أعلى الوسط': 'top_center', 'أعلى اليمين': 'top_right',
     'وسط اليسار': 'center_left', 'الوسط': 'center', 'وسط اليمين': 'center_right',
