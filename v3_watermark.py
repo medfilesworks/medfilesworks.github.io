@@ -48,8 +48,21 @@ def validate_config(config: dict, logo_bytes: bytes | None = None) -> dict:
         raise ValueError('زاوية الدوران خارج المجال المسموح')
     if not 0.5 <= cfg['scale'] <= 2.5:
         raise ValueError('حجم العلامة خارج المجال المسموح')
-    if cfg['placement'] not in ('center', 'bottom_right', 'repeated'):
+    positions = {
+        'top_left', 'top_center', 'top_right',
+        'center_left', 'center', 'center_right',
+        'bottom_left', 'bottom_center', 'bottom_right',
+        'repeated', 'custom'
+    }
+    if cfg['placement'] not in positions:
         raise ValueError('موضع العلامة غير معروف')
+    cfg['margin_percent'] = float(cfg.get('margin_percent', 0))
+    if not 0 <= cfg['margin_percent'] <= 12:
+        raise ValueError('الهامش يجب أن يكون بين 0 و12%')
+    cfg['custom_x'] = float(cfg.get('custom_x', 0.5))
+    cfg['custom_y'] = float(cfg.get('custom_y', 0.5))
+    if not all(math.isfinite(v) and 0 <= v <= 1 for v in (cfg['custom_x'], cfg['custom_y'])):
+        raise ValueError('الإحداثيات الحرة يجب أن تكون بين 0 و1')
     ImageColor.getrgb(str(cfg.get('color', '#45546B')))
     return cfg
 
@@ -120,7 +133,52 @@ def _stamp(width: int, height: int, cfg: dict, logo_bytes: bytes | None) -> Imag
                          expand=True)
     alpha = stamp.getchannel('A').point(lambda a: int(a * cfg['opacity']))
     stamp.putalpha(alpha)
+    # Remove transparent padding so corner presets really align to visible
+    # watermark pixels, not to a large invisible rotated bounding rectangle.
+    bounds = stamp.getchannel('A').getbbox()
+    return stamp.crop(bounds) if bounds else stamp
+
+
+def _fit_stamp(stamp: Image.Image, width: int, height: int) -> Image.Image:
+    """Keep even a long or rotated mark fully inside a small page."""
+    factor = min(1.0, width / max(1, stamp.width), height / max(1, stamp.height))
+    if factor < 1.0:
+        stamp = stamp.resize((max(1, round(stamp.width * factor)),
+                              max(1, round(stamp.height * factor))),
+                             Image.Resampling.LANCZOS)
     return stamp
+
+
+def position_xy(width: int, height: int, stamp_width: int, stamp_height: int,
+                config: dict) -> tuple[int, int]:
+    """Top-left position of the visible mark; coordinates always page-relative."""
+    placement = config.get('placement', 'center')
+    free_x = max(0, width - stamp_width)
+    free_y = max(0, height - stamp_height)
+    if placement == 'custom':
+        return (round(free_x * float(config.get('custom_x', .5))),
+                round(free_y * float(config.get('custom_y', .5))))
+    if placement == 'repeated':
+        raise ValueError('Repeated layout has no single position')
+    margin = round(min(width, height) * float(config.get('margin_percent', 0)) / 100)
+    margin_x = min(margin, free_x)
+    margin_y = min(margin, free_y)
+    row, col = (placement.split('_', 1) if '_' in placement else ('center', 'center'))
+    x = {'left': margin_x, 'center': free_x // 2,
+         'right': free_x - margin_x}[col]
+    y = {'top': margin_y, 'center': free_y // 2,
+         'bottom': free_y - margin_y}[row]
+    return (x, y)
+
+
+def drag_stamp_png(width: int, height: int, config: dict,
+                   logo_bytes: bytes | None = None) -> bytes:
+    """Preview only: the exact mark shape used by the watermark renderer."""
+    cfg = validate_config(config, logo_bytes)
+    stamp = _fit_stamp(_stamp(width, height, cfg, logo_bytes), width, height)
+    buffer = io.BytesIO()
+    stamp.save(buffer, format='PNG')
+    return buffer.getvalue()
 
 
 def overlay(width: int, height: int, config: dict,
@@ -131,7 +189,7 @@ def overlay(width: int, height: int, config: dict,
     if min(width, height) < 40:
         raise ValueError('أبعاد الملف صغيرة جدًا')
     canvas = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    stamp = _stamp(width, height, cfg, logo_bytes)
+    stamp = _fit_stamp(_stamp(width, height, cfg, logo_bytes), width, height)
     if cfg['placement'] == 'repeated':
         step_x = max(stamp.width + int(width*0.07), int(width * 0.32))
         step_y = max(stamp.height + int(height*0.08), int(height * 0.28))
@@ -139,13 +197,9 @@ def overlay(width: int, height: int, config: dict,
             offset = step_x//2 if row % 2 else 0
             for x in range(-stamp.width-offset, width + stamp.width, step_x):
                 canvas.alpha_composite(stamp, (x+offset, y))
-    elif cfg['placement'] == 'bottom_right':
-        x = max(0, width - stamp.width - max(18, int(width*0.04)))
-        y = max(0, height - stamp.height - max(18, int(height*0.04)))
-        canvas.alpha_composite(stamp, (x, y))
     else:
-        canvas.alpha_composite(stamp, ((width-stamp.width)//2,
-                                       (height-stamp.height)//2))
+        x, y = position_xy(width, height, stamp.width, stamp.height, cfg)
+        canvas.alpha_composite(stamp, (x, y))
     return canvas
 
 
