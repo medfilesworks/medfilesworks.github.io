@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -38,14 +39,18 @@ st.markdown('''<style>
 [data-testid="stMetric"] {border:1px solid rgba(125,125,125,.2);border-radius:12px;padding:12px;}
 </style>''', unsafe_allow_html=True)
 OWNER='marah.h.musallam21@gmail.com'
-try:
-position_editor = components.declare_component(
-'medfiles_position_editor',
-path=str(Path(file).resolve().parents[1] / 'v3_drag_editor'),
-)
-except Exception as exc:
-st.error(f'تعذر تحميل محرر السحب: {exc}')
-st.stop()
+def load_position_editor():
+    """Load the optional drag UI only when requested, never on app startup."""
+    editor_dir = Path(__file__).resolve().parents[1] / 'v3_drag_editor'
+    if not (editor_dir / 'index.html').is_file():
+        return None, 'v3_drag_editor/index.html is missing'
+    try:
+        return components.declare_component(
+            'medfiles_position_editor', path=str(editor_dir)
+        ), None
+    except Exception as exc:
+        return None, f'{type(exc).__name__}: {exc}'
+
 POSITION_OPTIONS = {
     'أعلى اليسار': 'top_left', 'أعلى الوسط': 'top_center', 'أعلى اليمين': 'top_right',
     'وسط اليسار': 'center_left', 'الوسط': 'center', 'وسط اليمين': 'center_right',
@@ -330,27 +335,76 @@ if current_step==STEPS[0]:
                             st.error('تعذر فتح محرر التوزيع الحر: '+str(exc))
                     if st.session_state.get('v3_drag_source')==source_key:
                         base=st.session_state.v3_drag_page
-                        with Image.open(io.BytesIO(base)) as bg:
-                            page_w,page_h=bg.size
-                        mark=drag_stamp_png(page_w,page_h,cfg,logo_bytes)
-                        with Image.open(io.BytesIO(mark)) as mark_image:
-                            mark_w=mark_image.width
+                        try:
+                            with Image.open(io.BytesIO(base)) as bg:
+                                page_w,page_h=bg.size
+                            mark=drag_stamp_png(page_w,page_h,cfg,logo_bytes)
+                            with Image.open(io.BytesIO(mark)) as mark_image:
+                                mark_w=mark_image.width
+                        except (OSError, ValueError, TypeError) as exc:
+                            st.error('تعذر تحضير معاينة السحب: ' + str(exc))
+                            mark = None
                         previous=st.session_state.get('v3_custom_coords') or {'x':0.5,'y':0.5}
-                        value=position_editor(
-                            page_png_b64=base64.b64encode(base).decode('ascii'),
-                            mark_png_b64=base64.b64encode(mark).decode('ascii'),
-                            page_width=page_w, stamp_width=mark_w,
-                            x=previous['x'],y=previous['y'],
-                            key='v3_position_editor')
-                        if isinstance(value,dict) and 'x' in value and 'y' in value:
-                            st.session_state.v3_custom_coords={
-                                'x':max(0,min(1,float(value['x']))),
-                                'y':max(0,min(1,float(value['y'])))}
+                        value = None
+                        editor, editor_error = load_position_editor()
+                        if editor is not None and mark is not None:
+                            try:
+                                value = editor(
+                                    page_png_b64=base64.b64encode(base).decode('ascii'),
+                                    mark_png_b64=base64.b64encode(mark).decode('ascii'),
+                                    page_width=page_w, stamp_width=mark_w,
+                                    x=previous['x'], y=previous['y'],
+                                    key='v3_position_editor',
+                                )
+                            except Exception as exc:
+                                editor_error = f'{type(exc).__name__}: {exc}'
+                        if editor_error:
+                            st.warning(
+                                'محرر السحب غير متاح حاليًا. '
+                                'يمكنك تحديد الموقع بالمنزلقات أدناه.'
+                            )
+                        if isinstance(value, dict) and 'x' in value and 'y' in value:
+                            try:
+                                drag_x = float(value['x'])
+                                drag_y = float(value['y'])
+                                if not (math.isfinite(drag_x) and math.isfinite(drag_y)):
+                                    raise ValueError('Invalid drag coordinates')
+                                drag_x = max(0.0, min(1.0, drag_x))
+                                drag_y = max(0.0, min(1.0, drag_y))
+                                new_drag = (round(drag_x, 5), round(drag_y, 5))
+                                if new_drag != st.session_state.get('_v3_last_drag_coords'):
+                                    st.session_state['_v3_last_drag_coords'] = new_drag
+                                    st.session_state['v3_position_x_pct'] = round(drag_x * 100, 1)
+                                    st.session_state['v3_position_y_pct'] = round(drag_y * 100, 1)
+                                    st.session_state.v3_custom_coords = {
+                                        'x': drag_x, 'y': drag_y,
+                                    }
+                            except (ValueError, TypeError, OverflowError):
+                                st.warning('تعذر قراءة إحداثيات السحب.')
                     else:
                         st.info('اضغطي «فتح الصفحة للتحريك الحر» لعرض الورقة وسحب العلامة عليها.')
-                    xvalue=st.session_state.get('v3_custom_coords') or {'x':0.5,'y':0.5}
-                    cfg['custom_x']=xvalue['x']
-                    cfg['custom_y']=xvalue['y']
+                    xvalue = st.session_state.get('v3_custom_coords') or {'x': 0.5, 'y': 0.5}
+                    if 'v3_position_x_pct' not in st.session_state:
+                        st.session_state['v3_position_x_pct'] = round(xvalue['x'] * 100, 1)
+                    if 'v3_position_y_pct' not in st.session_state:
+                        st.session_state['v3_position_y_pct'] = round(xvalue['y'] * 100, 1)
+                    x_col, y_col = st.columns(2)
+                    with x_col:
+                        x_pct = st.slider(
+                            'الموقع الأفقي (%)',
+                            min_value=0.0, max_value=100.0, step=0.1,
+                            key='v3_position_x_pct',
+                        )
+                    with y_col:
+                        y_pct = st.slider(
+                            'الموقع العمودي (%)',
+                            min_value=0.0, max_value=100.0, step=0.1,
+                            key='v3_position_y_pct',
+                        )
+                    xvalue = {'x': x_pct / 100, 'y': y_pct / 100}
+                    st.session_state.v3_custom_coords = xvalue
+                    cfg['custom_x'] = xvalue['x']
+                    cfg['custom_y'] = xvalue['y']
                     st.caption(f"الموضع المعتمد: أفقي {xvalue['x']*100:.1f}% | عمودي {xvalue['y']*100:.1f}%")
                 key=hashlib.sha256((json.dumps(cfg,sort_keys=True)+
                                     hashlib.sha256(logo_bytes or b'').hexdigest()+
