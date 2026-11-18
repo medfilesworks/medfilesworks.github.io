@@ -38,9 +38,16 @@ st.markdown('''<style>
 [data-testid="stMetric"] {border:1px solid rgba(125,125,125,.2);border-radius:12px;padding:12px;}
 </style>''', unsafe_allow_html=True)
 OWNER='marah.h.musallam21@gmail.com'
+_editor_dir = Path(file).resolve().parents[1] / 'v3_drag_editor'
+
+if _editor_dir.is_dir() and (_editor_dir / 'index.html').is_file():
 position_editor = components.declare_component(
-    'medfiles_position_editor',
-    path=str(Path(__file__).resolve().parents[1] / 'v3_drag_editor'),
+'medfiles_position_editor',
+path=str(_editor_dir),
+)
+else:
+position_editor = lambda **kwargs: None
+st.warning('محرر السحب غير متاح مؤقتًا.')
 )
 POSITION_OPTIONS = {
     'أعلى اليسار': 'top_left', 'أعلى الوسط': 'top_center', 'أعلى اليمين': 'top_right',
