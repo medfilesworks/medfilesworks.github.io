@@ -48,7 +48,6 @@ path=str(_editor_dir),
 else:
 position_editor = lambda **kwargs: None
 st.warning('محرر السحب غير متاح مؤقتًا.')
-)
 POSITION_OPTIONS = {
     'أعلى اليسار': 'top_left', 'أعلى الوسط': 'top_center', 'أعلى اليمين': 'top_right',
     'وسط اليسار': 'center_left', 'الوسط': 'center', 'وسط اليمين': 'center_right',
